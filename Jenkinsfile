@@ -2,7 +2,7 @@ pipeline {
   agent any
 
   options {
-    timestamps()
+    // 本机 Jenkins 未装 timestamper 插件，故不加 timestamps()（日志时间戳由 console 的 “View as plain text” 提供）
     disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '5'))
     timeout(time: 45, unit: 'MINUTES')
