@@ -109,7 +109,7 @@ springboot-vue-demo/
 前置：装好 Docker 和 docker compose（Windows 上 Docker Desktop + WSL2 也可以）。
 
 ```bash
-git clone https://github.com/R1ceShower0929/springboot-vue-demo.git
+git clone https://github.com/R1ceShower0929/springboot-demo.git
 cd springboot-vue-demo
 docker compose up -d --build
 ```
