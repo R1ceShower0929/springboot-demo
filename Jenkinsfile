@@ -91,8 +91,13 @@ pipeline {
             gate() {
               repo="$1"; tag="$2"
               url="$HARBOR_URL/api/v2.0/projects/$PROJECT/repositories/$repo/artifacts/$tag?with_scan_overview=true"
+              # Jenkins 在容器里，/etc/hosts 里的 harbor.local 会随容器重建丢失，
+              # 所以这里用 --resolve 把域名钉到 docker 网关（宿主的 443 端口），不依赖 DNS。
+              # X-Accept-Vulnerabilities 是 Harbor 2.x 必带的头，不带就不返回 scan_overview。
               for i in $(seq 1 40); do
-                body=$(curl -sk -u "$AU:$AP" "$url")
+                body=$(curl -sk --resolve harbor.local:443:172.17.0.1 \
+                       -H 'X-Accept-Vulnerabilities: application/vnd.security.vulnerability.report; version=1.1' \
+                       -u "$AU:$AP" "$url" || true)
                 status=$(echo "$body" | grep -o '"scan_status":"[^"]*"' | head -1 | cut -d'"' -f4)
                 [ "$status" = "Success" ] && break
                 echo "扫描未完成（$repo:$tag，第 $i 次，状态=${status:-Pending}），继续等待…"
@@ -104,7 +109,6 @@ pipeline {
               crit=$(echo "$body" | grep -o '"Critical":[0-9]*' | head -1 | cut -d: -f2); crit=${crit:-0}
               high=$(echo "$body" | grep -o '"High":[0-9]*'     | head -1 | cut -d: -f2); high=${high:-0}
               echo "漏洞统计 $repo:$tag -> Critical=$crit High=$high"
-              echo "$crit" > /tmp/crit.$repo
               [ "$crit" -eq 0 ] || { echo "存在 Critical 漏洞，阻断发布"; return 2; }
             }
             gate backend  "$TAG"
