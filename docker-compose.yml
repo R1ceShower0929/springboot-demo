@@ -1,0 +1,101 @@
+services:
+  # ---------- MySQL 主库：承担所有写操作 ----------
+  mysql-master:
+    image: mysql:8.0
+    container_name: demo-mysql-master
+    restart: unless-stopped
+    command:
+      - --server-id=1
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456
+      MYSQL_DATABASE: demo
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./docker/mysql/master/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - mysql-master-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123456"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+
+  # ---------- MySQL 从库：承担读操作，只读 ----------
+  mysql-slave:
+    image: mysql:8.0
+    container_name: demo-mysql-slave
+    restart: unless-stopped
+    command:
+      - --server-id=2
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+      # 只读从库：root 有 SUPER 权限仍可完成复制配置，应用账号无 SUPER 则写操作报 1290
+      - --read-only=ON
+    environment:
+      MYSQL_ROOT_PASSWORD: root123456
+      TZ: Asia/Shanghai
+    ports:
+      - "3307:3306"
+    depends_on:
+      mysql-master:
+        condition: service_healthy
+    volumes:
+      - ./docker/mysql/slave/init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+      - mysql-slave-data:/var/lib/mysql
+
+  # ---------- Redis：缓存 ----------
+  redis:
+    image: redis:7-alpine
+    container_name: demo-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  # ---------- 后端 ----------
+  backend:
+    build: ./backend
+    container_name: demo-backend
+    restart: unless-stopped
+    environment:
+      MYSQL_MASTER_HOST: mysql-master
+      MYSQL_MASTER_PORT: 3306
+      MYSQL_SLAVE_HOST: mysql-slave
+      MYSQL_SLAVE_PORT: 3306
+      MYSQL_USER: demo
+      MYSQL_PASSWORD: demo123456
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      mysql-master:
+        condition: service_healthy
+      mysql-slave:
+        condition: service_started
+      redis:
+        condition: service_started
+    ports:
+      - "8090:8080"
+
+  # ---------- 前端 ----------
+  frontend:
+    build: ./frontend
+    container_name: demo-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8095:80"
+
+volumes:
+  mysql-master-data:
+  mysql-slave-data:
+  redis-data:
