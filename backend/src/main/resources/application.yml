@@ -32,6 +32,7 @@ spring:
     redis:
       host: ${REDIS_HOST:127.0.0.1}
       port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
       database: 0
       timeout: 3s
 
@@ -50,3 +51,24 @@ mybatis-plus:
 logging:
   level:
     com.demo: info
+
+# ===== 健康检查（K8s 的 startup / readiness / liveness 探针都打这里）=====
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never      # 不向外部暴露数据库、磁盘等内部细节
+      probes:
+        enabled: true          # 开启 /actuator/health/{liveness,readiness}
+  info:
+    env:
+      enabled: true
+  health:
+    # 就绪探针只依赖数据库与 Redis：库连不上 = 未就绪，K8s 不会把流量导进来
+    redis:
+      enabled: true
+    db:
+      enabled: true
