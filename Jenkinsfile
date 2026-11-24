@@ -123,16 +123,17 @@ pipeline {
               curl -sk --resolve harbor.local:443:172.17.0.1 \
                 -H 'X-Accept-Vulnerabilities: application/vnd.security.vulnerability.report; version=1.1' \
                 -u "$AU:$AP" "$base/additions/vulnerabilities" > "/tmp/$repo-report.json" || true
-              sed 's/},{"id":/}\n{"id":/g' "/tmp/$repo-report.json" > "/tmp/$repo-lines.txt"
+              # Harbor 返回的是单行 JSON，用 awk 按对象分隔符 "},{" 切成一条一行（避免在 Groovy 字符串里写反斜杠）
+              awk 'BEGIN{RS="},{"} {print}' "/tmp/$repo-report.json" > "/tmp/$repo-lines.txt"
 
               blocked=0; waived=0
               while IFS= read -r line; do
                 # 报告头里也有一个 "severity":"Critical"（整体最高级别），所以取该行最后一个 severity 才是这条 CVE 自己的
                 sev=$(echo "$line" | grep -o '"severity":"[^"]*"' | tail -1 | cut -d'"' -f4)
                 [ "$sev" = "Critical" ] || continue
-                id=$(echo "$line"  | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-                pkg=$(echo "$line" | sed -n 's/.*"package":"\([^"]*\)".*/\1/p')
-                fxv=$(echo "$line" | sed -n 's/.*"fix_version":"\([^"]*\)".*/\1/p')
+                id=$(echo "$line"  | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+                pkg=$(echo "$line" | grep -o '"package":"[^"]*"' | head -1 | cut -d'"' -f4)
+                fxv=$(echo "$line" | grep -o '"fix_version":"[^"]*"' | head -1 | cut -d'"' -f4)
                 if is_waived "$id"; then
                   waived=$((waived+1)); echo "  豁免（ci/security-waivers.txt）：$id  $pkg"
                 else
