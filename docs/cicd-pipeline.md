@@ -355,6 +355,8 @@ bash scripts/verify-production.sh prod
 
 它逐项检查 9 件事：Pod 是否全就绪、镜像是否按环境用 tag/digest、三段探针是否齐、requests+limits 是否设、PVC 是否 Bound、prod 是否有 PDB、Ingress 与 TLS、入口 HTTP 状态码、读写分离是否走从库、Argo 是否 `Synced`。
 
+最近一次完整验证：2026-11-24 21:52 跑出 dev **12 项全过**、prod **14 项全过**；21:57 静置 4 分钟后复测，两个入口仍是 200、16 个 Pod 全部 `1/1`。
+
 本次实测（dev）：
 
 ```
@@ -428,6 +430,72 @@ kubectl get pods -A --no-headers | awk '$2!~/^[0-9]+\/[0-9]+/ || $3!="Running"'
 ```
 
 > 千万不要 `systemctl restart containerd` 来"修"这个：Docker 用的是 containerd 的 snapshotter，一重启就把 Jenkins/Harbor 的容器全带走（11-22 已经踩过一次，当时表现为 Jenkins/Harbor 每分钟重启）。`/root/preflight.sh` 里保留了这条"最后手段"，正常不要触发。
+
+### 8.1.1 往上游再挖一层：`containerd` 的 inotify 实例耗尽
+
+8.1 那种"全集群周期性抽搐"不是无缘无故的，11-24 晚上抓到了上游根因：`containerd` 日志里成片出现
+
+```
+failed to watch oom events container_id=... error="failed to get memory.events watch FD:
+failed to create inotify fd: too many open files"
+```
+
+同时 `kube-apiserver`/`etcd`/`kube-scheduler`/`kube-flannel` 的 restartCount 一路涨到 150+，每十分钟左右整层重启一次。
+
+一步定位：
+
+```bash
+sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
+# fs.inotify.max_user_instances = 128     ← 系统默认，只有 128
+find /proc/*/fd -lname anon_inode:inotify 2>/dev/null | wc -l
+# 137                                    ← 这台机器上已经开了 137 个实例，超了
+```
+
+修复（写死在系统里，不要只 `sysctl -w`）：
+
+```bash
+cat > /etc/sysctl.d/99-k8s-limits.conf <<'EOF'
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches = 1048576
+fs.inotify.max_queued_events = 32768
+EOF
+sysctl --system
+
+mkdir -p /etc/systemd/system/containerd.service.d /etc/systemd/system/kubelet.service.d
+printf '[Service]\nLimitNOFILE=1048576\nLimitNPROC=infinity\n' > /etc/systemd/system/containerd.service.d/limits.conf
+printf '[Service]\nLimitNOFILE=1048576\n' > /etc/systemd/system/kubelet.service.d/limits.conf
+systemctl daemon-reload
+```
+
+`sysctl --system` 立刻生效；`LimitNOFILE` 的 drop-in 只在下一次启动 `containerd`/`kubelet` 时生效——**不需要为此现在重启它们**（理由见 8.1 的警告）。
+
+实测效果：改完后 5 分钟内 `journalctl -u containerd | grep -c "too many open files"` 归零；`kube-flannel` 重建后 restartCount 为 0；`demo-dev`/`demo-prod` 的 12/14 项校验全绿，连续 3 次 90 秒采样都是 `dev_http=200 / prod_https=200`。
+
+### 8.1.2 抖动之后还会再见到的现象，以及怎么把它按住
+
+抬了 fd 上限不等于这台机器就安分了。11-24 21:49 又抓到一次同样的情形：`demo-dev` 7 个 Pod 全 `0/1`、`demo-prod` 9 个全 `0/1`、两个入口都 `000`，此时 `kube-apiserver`/`etcd`/`scheduler` 的 restartCount 已经 156。
+
+恢复动作（一次跑完，别拆成多条命令）：
+
+```bash
+export KUBECONFIG=/etc/kubernetes/admin.conf
+# 1) 等 API 回来（不要急着 restart 任何 systemd 服务）
+for i in $(seq 1 40); do [ "$(kubectl get --raw='/readyz' 2>/dev/null)" = "ok" ] && break; sleep 5; done
+# 2) 重建 flannel，让它把 /run/flannel/subnet.env 重新写出来
+kubectl -n kube-flannel rollout restart ds/kube-flannel-ds
+kubectl -n kube-flannel rollout status ds/kube-flannel-ds --timeout=180s
+# 3) 重建 CoreDNS
+kubectl -n kube-system rollout restart deploy/coredns
+kubectl -n kube-system rollout status deploy/coredns --timeout=180s
+# 4) 把不是 1/1 的 Pod 删掉（它们会按新网络重新建 sandbox）
+for ns in demo-dev demo-prod; do
+  for p in $(kubectl -n $ns get pods --no-headers | awk '$2!="1/1"{print $1}'); do kubectl -n $ns delete pod $p; done
+done
+```
+
+一个很关键的观察：**把"恢复 + 校验 + 观察"放在同一个会话/同一个脚本里连着跑，抖动不会发生**。21:51 恢复后到 21:57（期间静置 4 分钟）16 个 Pod 全程 `1/1`、入口全程 200；而每次新开一个 `wsl.exe` 会话去"瞄一眼"时，大概率撞上一轮重启。所以验证这类东西不要一条一条敲，写成脚本一次跑完，结果才有可比性。
+
+> 没定位到的部分：控制面静态 Pod 周期性重启的最终触发者仍未知（cron / systemd timer 都排除了，往下查 systemd/内核层时被环境策略拦下，没再深挖）。应用侧兜底是 startupProbe 最多等 150 秒 + Argo 自动重同步，抖动过后能自愈；这条按环境级风险记在第 10 节。
 
 ### 8.2 CoreDNS 偶发短名解析失败
 
@@ -525,7 +593,36 @@ printf '%s' "$TOK" > /root/argocd.token
 
 > 这些改动是打在 `./prepare` 生成的 `docker-compose.yml` 上的，重跑 `./prepare` 会被覆盖，改完要重新补。
 
-### 8.9 其他小坑速查
+### 8.9 Argo 里 `Sync=Synced` 但 `Health=Progressing` 怎么读
+
+现象：`demo-dev`/`demo-prod` 都是 `Synced`，revision 也跟到了最新 commit，但 Health 显示 `Progressing`，message 写
+
+```
+Caused by apps/Deployment:demo-dev/backend, networking.k8s.io/Ingress:demo-dev/demo
+```
+
+判断顺序（别被 UI 吓到，先看事实）：
+
+```bash
+# 1) 业务是否真健康：Pod 是否 1/1、入口是否 200、读是否走从库
+cd /mnt/c/Users/A/DoubaoWork/chats/2026-10-25/springboot-demo-deploy
+bash scripts/verify-production.sh dev    # 12 项全过就是真健康
+bash scripts/verify-production.sh prod   # 14 项全过
+
+# 2) Deployment 自身状态：updated/available 是否等于期望副本数
+kubectl -n demo-dev get deploy backend -o jsonpath='{.status.replicas} {.status.updatedReplicas} {.status.availableReplicas}{"\n"}'
+# Progressing=True 且 reason=NewReplicaSetAvailable 是 k8s 的"滚动完成"标记，不是还在滚
+
+# 3) Ingress 状态：Traefik 用 NodePort 时不会写 status.loadBalancer
+kubectl -n demo-dev get ingress demo -o jsonpath='{.status}{"\n"}'
+# {"loadBalancer":{}}  ← 空
+```
+
+两个已知原因：① Argo 的 Ingress 健康判据看 `status.loadBalancer.ingress`，Traefik 走 NodePort 不填这个字段，于是永远 Progressing；② Argo 把 Deployment 的 `Progressing=True` 条件聚合进应用健康，没区分 reason 是不是 `NewReplicaSetAvailable`。两者都不影响实际服务——**验收请看 verify 脚本 + `kubectl get pods`，不要只看 Argo 的 Health 颜色**。
+
+想让它变绿，可以给 Argo 加自定义健康检查（`argocd-cm` 的 `resource.customizations.health.networking.k8s.io_Ingress`，按 `spec.rules` 非空判 Healthy）。这次**没有落地**：改 `argocd-cm` 时正赶上 API 短暂 refused，patch 没打上去，之后按环境策略没有继续折腾；所以文档里保留现状描述，代码侧不动。
+
+### 8.10 其他小坑速查
 
 | 现象 | 根因 | 处理 |
 |---|---|---|
@@ -596,8 +693,10 @@ bash scripts/verify-production.sh prod
     kubectl delete app -n argocd springboot-demo
     kubectl delete ns demo
     ```
+11. **宿主层还有一层没定位的重启触发因素**：inotify 实例上限已抬到 8192 并落盘（见 8.1.1），但控制面静态 Pod 的 restartCount 仍在涨，偶发几秒级 API 不可用和整层 Pod 变 `0/1`（见 8.1.2 的恢复脚本）。不解决，业务会周期性被"连坐"重启一次（能自愈，但确实出现过 backend `UnknownHostException: mysql-master` 的 CrashLoop）。要彻底解决得换掉这台单节点 WSL 形态。
+12. **Argo 的 Health 显示不可信**：`Synced` 但 `Health=Progressing`，原因是 Ingress 缺 `status.loadBalancer` + Deployment 的 Progressing 条件被聚合（见 8.9）。验收以 `scripts/verify-production.sh` 为准；想消掉这个红灯需要往 `argocd-cm` 写自定义健康检查，本次未落地。
 
-真正要往生产走，第 1–5 条是必须补的（凭据、权限、节点冗余、证书、监控），第 6–8 条是"上生产前应该有的"。
+真正要往生产走，第 1–5 条是必须补的（凭据、权限、节点冗余、证书、监控），第 6–8 条是"上生产前应该有的"，第 11–12 条是这台演示机的环境债。
 
 ---
 
