@@ -88,32 +88,66 @@ pipeline {
                                           usernameVariable: 'AU', passwordVariable: 'AP')]) {
           sh '''
             set -eu
+            # 门禁规则：任一 Critical 未登记在豁免清单 -> 阻断发布；High 只告警（按团队 SLA 处理）
+            WAIVER="$WORKSPACE/ci/security-waivers.txt"
+            is_waived() { [ -f "$WAIVER" ] && grep -qE "^[[:space:]]*$1([[:space:]]|$)" "$WAIVER"; }
+
             gate() {
               repo="$1"; tag="$2"
-              url="$HARBOR_URL/api/v2.0/projects/$PROJECT/repositories/$repo/artifacts/$tag?with_scan_overview=true"
-              # Jenkins 在容器里，/etc/hosts 里的 harbor.local 会随容器重建丢失，
-              # 所以这里用 --resolve 把域名钉到 docker 网关（宿主的 443 端口），不依赖 DNS。
+              base="$HARBOR_URL/api/v2.0/projects/$PROJECT/repositories/$repo/artifacts/$tag"
+              # Jenkins 跑在容器里，/etc/hosts 里的 harbor.local 会随容器重建丢失，
+              # 所以用 --resolve 把域名钉到 docker 网关（宿主的 443 端口），不依赖容器 DNS。
               # X-Accept-Vulnerabilities 是 Harbor 2.x 必带的头，不带就不返回 scan_overview。
-              for i in $(seq 1 40); do
+              status=""
+              for i in $(seq 1 60); do
                 body=$(curl -sk --resolve harbor.local:443:172.17.0.1 \
                        -H 'X-Accept-Vulnerabilities: application/vnd.security.vulnerability.report; version=1.1' \
-                       -u "$AU:$AP" "$url" || true)
+                       -u "$AU:$AP" "$base?with_scan_overview=true" || true)
                 status=$(echo "$body" | grep -o '"scan_status":"[^"]*"' | head -1 | cut -d'"' -f4)
                 [ "$status" = "Success" ] && break
                 echo "扫描未完成（$repo:$tag，第 $i 次，状态=${status:-Pending}），继续等待…"
                 sleep 10
               done
               if [ "$status" != "Success" ]; then
-                echo "扫描超时或失败：$repo:$tag（status=${status:-unknown}）"; return 1
+                echo "扫描超时或失败：$repo:$tag（status=${status:-unknown}）；拿不到报告一律不放行"
+                return 1
               fi
-              crit=$(echo "$body" | grep -o '"Critical":[0-9]*' | head -1 | cut -d: -f2); crit=${crit:-0}
-              high=$(echo "$body" | grep -o '"High":[0-9]*'     | head -1 | cut -d: -f2); high=${high:-0}
-              echo "漏洞统计 $repo:$tag -> Critical=$crit High=$high"
-              [ "$crit" -eq 0 ] || { echo "存在 Critical 漏洞，阻断发布"; return 2; }
+
+              cri=$(echo "$body" | grep -o '"Critical":[0-9]*' | head -1 | cut -d: -f2); cri=${cri:-0}
+              hig=$(echo "$body" | grep -o '"High":[0-9]*'     | head -1 | cut -d: -f2); hig=${hig:-0}
+              fix=$(echo "$body" | grep -o '"fixable":[0-9]*'  | head -1 | cut -d: -f2); fix=${fix:-0}
+              echo "==================== $repo:$tag ===================="
+              echo "Critical=$cri  High=$hig（可修复总计 $fix）"
+
+              # 取完整报告，逐条判定 CVE 是否登记豁免（Harbor 返回单行 JSON，先拆成一行一条）
+              curl -sk --resolve harbor.local:443:172.17.0.1 \
+                -H 'X-Accept-Vulnerabilities: application/vnd.security.vulnerability.report; version=1.1' \
+                -u "$AU:$AP" "$base/additions/vulnerabilities" > "/tmp/$repo-report.json" || true
+              sed 's/},{"id":/}\n{"id":/g' "/tmp/$repo-report.json" > "/tmp/$repo-lines.txt"
+
+              blocked=0; waived=0
+              while IFS= read -r line; do
+                # 报告头里也有一个 "severity":"Critical"（整体最高级别），所以取该行最后一个 severity 才是这条 CVE 自己的
+                sev=$(echo "$line" | grep -o '"severity":"[^"]*"' | tail -1 | cut -d'"' -f4)
+                [ "$sev" = "Critical" ] || continue
+                id=$(echo "$line"  | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+                pkg=$(echo "$line" | sed -n 's/.*"package":"\([^"]*\)".*/\1/p')
+                fxv=$(echo "$line" | sed -n 's/.*"fix_version":"\([^"]*\)".*/\1/p')
+                if is_waived "$id"; then
+                  waived=$((waived+1)); echo "  豁免（ci/security-waivers.txt）：$id  $pkg"
+                else
+                  blocked=$((blocked+1))
+                  if [ -n "$fxv" ]; then echo "  ✗ 阻断：$id  $pkg  可升级到 $fxv"
+                  else echo "  ✗ 阻断：$id  $pkg  当前无修复版本"; fi
+                fi
+              done < "/tmp/$repo-lines.txt"
+
+              echo "Critical 判定：阻断 $blocked 条，豁免 $waived 条"
+              [ "$blocked" -eq 0 ] || { echo "存在未豁免的 Critical 漏洞，阻断发布"; return 2; }
             }
             gate backend  "$TAG"
             gate frontend "$TAG"
-            echo "安全门禁通过（无 Critical；High 仅告警，生产环境建议按团队 SLA 收紧）"
+            echo "安全门禁通过：两个镜像均无未豁免的 Critical（High 见上方统计）"
           '''
         }
       }

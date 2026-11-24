@@ -11,6 +11,10 @@ RUN npm run build
 # 运行阶段：非 root 的 Nginx 托管静态文件并反代后端
 # unprivileged 镜像以 uid 101 运行、默认监听 8080，容器不必以 root 启动
 FROM nginxinc/nginx-unprivileged:1.27-alpine
+# 运行镜像里 openssl/brotli 等系统包常带可修复 CVE，构建时统一升到发行版最新补丁（必须 root 才能装包）
+USER root
+RUN apk upgrade --no-cache && rm -rf /var/cache/apk/*
+USER 101
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 8080
