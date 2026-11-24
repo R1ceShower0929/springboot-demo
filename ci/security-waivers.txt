@@ -10,3 +10,9 @@
 #
 # 示例（当前为空，即不豁免任何 Critical）：
 # CVE-2026-12345  # 无修复版本，ubuntu 22.04 等上游 backport，复查 2026-12-31
+
+# ---- 已登记豁免 ----
+# Spring Framework 6.2.x 的两个 Critical 只有 7.0.9 才有修复，而 7.0 需要 Spring Boot 4.x（Jakarta 迁移）。
+# 现阶段保留在 6.2.x，登记为已知风险，随 Boot 4 升级一起消除。
+CVE-2026-47884  # spring-webmvc 6.2.x，修复版本仅 7.0.9；等 Boot 4 迁移，复查 2026-12-31
+CVE-2026-47890  # spring-webmvc 6.2.x，修复版本仅 7.0.9；等 Boot 4 迁移，复查 2026-12-31
